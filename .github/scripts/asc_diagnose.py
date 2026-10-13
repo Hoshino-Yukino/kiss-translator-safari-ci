@@ -112,3 +112,26 @@ s, b = get("/v1/users", limit=1)
 print(f"  HTTP {s}")
 if s != 200:
     show_err(s, b)
+
+print("== 最近的构建 (GET /v1/builds)")
+groups = {}
+for a in apps:
+    s, b = get("/v1/betaGroups", limit=50, **{"filter[app]": a["id"], "fields[betaGroups]": "name,isInternalGroup,hasAccessToAllBuilds"})
+    if s == 200:
+        for g in b["data"]:
+            groups[g["id"]] = g["attributes"]
+            print(f"  [{a['attributes']['bundleId']}] betaGroup {g['attributes']['name']!r} internal={g['attributes']['isInternalGroup']} allBuilds={g['attributes'].get('hasAccessToAllBuilds')}")
+    s, b = get("/v1/builds", limit=6, sort="-uploadedDate", include="preReleaseVersion,buildBetaDetail",
+               **{"filter[app]": a["id"], "fields[builds]": "version,processingState,usesNonExemptEncryption,uploadedDate,expired,preReleaseVersion,buildBetaDetail",
+                  "fields[preReleaseVersions]": "platform,version", "fields[buildBetaDetails]": "internalBuildState"})
+    if s != 200:
+        show_err(s, b); continue
+    inc = {(x["type"], x["id"]): x["attributes"] for x in b.get("included", [])}
+    for x in b["data"]:
+        at, rel = x["attributes"], x["relationships"]
+        prv = inc.get(("preReleaseVersions", (rel["preReleaseVersion"]["data"] or {}).get("id")), {})
+        bbd = inc.get(("buildBetaDetails", (rel["buildBetaDetail"]["data"] or {}).get("id")), {})
+        s2, b2 = get(f"/v1/builds/{x['id']}/relationships/betaGroups")
+        gnames = [groups.get(g["id"], {}).get("name", g["id"]) for g in b2.get("data", [])] if s2 == 200 else f"HTTP {s2}"
+        print(f"  [{a['attributes']['bundleId']}] {prv.get('platform')} {prv.get('version')} ({at['version']}) uploaded={at['uploadedDate'][:16]} "
+              f"processing={at['processingState']} encryption={at.get('usesNonExemptEncryption')} internal={bbd.get('internalBuildState')} groups={gnames}")
