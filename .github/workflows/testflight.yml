@@ -36,7 +36,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Keepalive（防止公开仓库 60 天无活动后定时任务被停用）
         run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/${WORKFLOW_FILE}/enable"
@@ -91,20 +91,22 @@ jobs:
           [ -n "$ASC_KEY_ID" ]    || missing="$missing ASC_KEY_ID"
           [ -n "$ASC_ISSUER_ID" ] || missing="$missing ASC_ISSUER_ID"
           [ -n "${{ secrets.ASC_KEY_P8 }}" ] || missing="$missing ASC_KEY_P8"
+          [ -n "${{ secrets.DEV_CERT_P12_BASE64 }}" ] || missing="$missing DEV_CERT_P12_BASE64"
+          [ -n "${{ secrets.DEV_CERT_PASSWORD }}" ]   || missing="$missing DEV_CERT_PASSWORD"
           if [ -n "$missing" ]; then
             echo "::error::缺少配置:$missing"; exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Checkout upstream ${{ env.TAG }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ env.TAG }}
           path: upstream
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
 
@@ -150,6 +152,29 @@ jobs:
           echo "BUILD_NUMBER=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
           echo "Project: $proj / Scheme: $scheme"
 
+      # Archive 阶段由自动签名使用开发证书签名，需要证书私钥；
+      # 导出上传阶段的发布证书由 API Key 的云端签名负责。
+      - name: Import development certificate
+        env:
+          P12_BASE64: ${{ secrets.DEV_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.DEV_CERT_PASSWORD }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_pw=$(openssl rand -base64 24)
+          printf '%s' "$P12_BASE64" | base64 --decode > "$RUNNER_TEMP/dev.p12"
+
+          security create-keychain -p "$keychain_pw" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_pw" "$keychain"
+          security import "$RUNNER_TEMP/dev.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
+          security set-key-partition-list -S apple-tool:,apple: -k "$keychain_pw" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/dev.p12"
+
+          echo "SIGNING_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "导入的签名身份："
+          security find-identity -v -p codesigning "$keychain"
+
       - name: Archive
         run: |
           xcodebuild archive \
@@ -194,16 +219,18 @@ jobs:
 
           echo "### 已上传 ${PLATFORM} ${TAG}（build ${BUILD_NUMBER}）到 TestFlight" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Clean up signing key
+      - name: Clean up signing key & keychain
         if: always()
-        run: rm -rf "$RUNNER_TEMP/asc"
+        run: |
+          rm -rf "$RUNNER_TEMP/asc" "$RUNNER_TEMP/dev.p12"
+          [ -n "${SIGNING_KEYCHAIN:-}" ] && security delete-keychain "$SIGNING_KEYCHAIN" || true
 
   # 所有平台都上传成功后才记录状态；任一平台失败，第二天会自动重试
   record:
     needs: [check, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Save state
         env:
           TAG: ${{ needs.check.outputs.tag }}
