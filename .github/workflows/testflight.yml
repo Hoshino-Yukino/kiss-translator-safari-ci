@@ -148,6 +148,26 @@ jobs:
           '
           grep -A7 'export const CLIENT_EXTS' src/config/client.js
 
+          # Claude 提示词缓存：给发往官方 api.anthropic.com 的系统提示词加 cache_control，
+          # 整页翻译的连续请求可复用缓存（不足最小长度时 API 只是不缓存，不报错）。
+          # 第三方「Claude 兼容」网关不一定支持该字段，保持原样。
+          node -e '
+            const fs = require("fs");
+            const f = "src/apis/trans.js";
+            const s = fs.readFileSync(f, "utf8");
+            const start = s.indexOf("const genClaude = (");
+            const end = s.indexOf("\nconst ", start + 1);
+            if (start < 0 || end < 0) { console.log("::error::上游 " + f + " 已变更，找不到 genClaude"); process.exit(1); }
+            const fn = s.slice(start, end);
+            if (fn.includes("cache_control")) { console.log("genClaude 已包含 cache_control，跳过"); process.exit(0); }
+            const old = "...(systemPrompt?.trim() ? { system: systemPrompt } : {}),";
+            if (!fn.includes(old)) { console.log("::error::上游 genClaude 的 system 写法已变更，请检查 " + f); process.exit(1); }
+            const neu = "...(systemPrompt?.trim() ? { system: /^https:\\/\\/api\\.anthropic\\.com\\//.test(url) ? [{ type: \"text\", text: systemPrompt, cache_control: { type: \"ephemeral\" } }] : systemPrompt } : {}),";
+            fs.writeFileSync(f, s.slice(0, start) + fn.replace(old, neu) + s.slice(end));
+            console.log("genClaude 已加入 cache_control");
+          '
+          grep -n 'cache_control' src/apis/trans.js
+
           # Safari 扩展上传校验要求 manifest 的 description（app_description）不超过 112 个字符
           node -e '
             const fs = require("fs");
