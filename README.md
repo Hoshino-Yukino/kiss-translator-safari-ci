@@ -40,9 +40,25 @@ iOS 和 macOS 两个 target 通常共用这两个 ID，不需要再为 macOS 单
 | Secret | `ASC_KEY_ID` | API Key 的 Key ID |
 | Secret | `ASC_ISSUER_ID` | Issuer ID |
 | Secret | `ASC_KEY_P8` | `.p8` 文件的完整内容（含 `-----BEGIN PRIVATE KEY-----` 首尾行） |
+| Secret | `DEV_CERT_P12_BASE64` | Apple Development 证书（含私钥）导出的 `.p12`，再转成 base64 |
+| Secret | `DEV_CERT_PASSWORD` | 导出 `.p12` 时设置的密码 |
 | Variable | `BUNDLE_ID` | App 本体的 Bundle ID，如 `com.yourname.kiss-translator` |
 
 **Settings → Actions → General → Workflow permissions** 选 **Read and write permissions**。
+
+#### 导出开发证书（在自己的 Mac 上操作）
+
+Archive 阶段，Xcode 的自动签名会先用开发证书签名，而 API Key 的云端签名只管导出上传时用的发布证书，所以 CI 上需要你的开发证书。
+
+1. Xcode → Settings → Accounts → 选中账号 → Manage Certificates，确认有 **Apple Development** 证书（没有就点 + 创建）。
+2. 打开「钥匙串访问」→「我的证书」，找到 `Apple Development: 你的名字`，展开确认下面带有私钥。
+3. 右键 → 导出，格式选 `.p12`，设置一个密码（填进 `DEV_CERT_PASSWORD`）。
+4. 转成 base64 并复制到剪贴板，粘贴进 `DEV_CERT_P12_BASE64`：
+   ```bash
+   base64 -i Certificates.p12 | pbcopy
+   ```
+
+开发版描述文件需要至少注册一台设备：iOS 需要注册你的 iPhone，macOS 需要注册你的 Mac。用 Xcode 往设备上装过一次就会自动注册，也可以在 developer.apple.com 的 Devices 里手动添加。
 
 ### 4. 首次运行
 
