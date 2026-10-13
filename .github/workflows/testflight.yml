@@ -1,0 +1,204 @@
+name: Safari iOS → TestFlight
+
+# 每天检查一次上游 release：
+#   - 上游有新版本 → 构建并上传
+#   - 距离上次上传已满 REFRESH_DAYS 天 → 重新构建上传，避免 TestFlight 构建 90 天过期
+#   - 手动运行时可勾选 force 强制构建
+on:
+  schedule:
+    - cron: '17 21 * * *'   # UTC 21:17 = 日本时间 06:17
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制构建并上传'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write   # 提交 .state/ 记录
+  actions: write    # keepalive：重新启用本 workflow
+
+concurrency:
+  group: testflight
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: fishjar/kiss-translator
+  REFRESH_DAYS: '60'          # TestFlight 构建 90 天过期，留出余量
+  WORKFLOW_FILE: testflight.yml   # 本文件的文件名，改名时同步修改
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.decide.outputs.tag }}
+      build: ${{ steps.decide.outputs.build }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Keepalive（防止公开仓库 60 天无活动后定时任务被停用）
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/${WORKFLOW_FILE}/enable"
+
+      - name: Decide whether to build
+        id: decide
+        run: |
+          tag=$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)
+          last_tag=$(cat .state/last-built 2>/dev/null || true)
+          last_upload=$(cat .state/last-upload 2>/dev/null || echo 0)
+          age_days=$(( ( $(date +%s) - last_upload ) / 86400 ))
+
+          build=false
+          reason="上游 ${tag} 已构建，距上次上传 ${age_days} 天，无需构建"
+          if [ "${{ inputs.force }}" = "true" ]; then
+            build=true; reason="手动强制构建"
+          elif [ "$tag" != "$last_tag" ]; then
+            build=true; reason="上游新版本 ${tag}（上次构建：${last_tag:-无}）"
+          elif [ "$age_days" -ge "$REFRESH_DAYS" ]; then
+            build=true; reason="距上次上传已 ${age_days} 天，刷新 TestFlight 构建"
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "### ${reason}" >> "$GITHUB_STEP_SUMMARY"
+          echo "$reason"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+      BUNDLE_ID: ${{ vars.BUNDLE_ID }}
+      TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+    steps:
+      - name: Check configuration
+        run: |
+          missing=""
+          [ -n "$BUNDLE_ID" ]     || missing="$missing BUNDLE_ID(variable)"
+          [ -n "$TEAM_ID" ]       || missing="$missing APPLE_TEAM_ID"
+          [ -n "$ASC_KEY_ID" ]    || missing="$missing ASC_KEY_ID"
+          [ -n "$ASC_ISSUER_ID" ] || missing="$missing ASC_ISSUER_ID"
+          [ -n "${{ secrets.ASC_KEY_P8 }}" ] || missing="$missing ASC_KEY_P8"
+          if [ -n "$missing" ]; then
+            echo "::error::缺少配置:$missing"; exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Checkout upstream ${{ env.TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ env.TAG }}
+          path: upstream
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install pnpm & dependencies
+        working-directory: upstream
+        run: |
+          npm install -g "pnpm@$(cat .pnpm-version)"
+          pnpm install --frozen-lockfile
+
+      - name: Patch bundle id & team
+        working-directory: upstream
+        run: |
+          script=src/scripts/build-safari.mjs
+          if ! grep -q 'com\.fishjar\.kiss-translator' "$script"; then
+            echo "::error::上游构建脚本已变更，找不到默认 Bundle ID，请检查 $script"; exit 1
+          fi
+          sed -i '' "s/com\.fishjar\.kiss-translator/${BUNDLE_ID}/" "$script"
+          echo "DEVELOPMENT_TEAM=${TEAM_ID}" > .env.local
+
+      - name: Build Xcode project
+        working-directory: upstream
+        env:
+          CI: 'false'   # react-scripts 在 CI=true 时会把 lint 警告当成错误
+        run: pnpm build:safari
+
+      - name: Prepare signing key & project info
+        run: |
+          key_dir="$RUNNER_TEMP/asc"
+          mkdir -p "$key_dir"
+          printf '%s\n' "${{ secrets.ASC_KEY_P8 }}" > "$key_dir/AuthKey.p8"
+          echo "ASC_KEY_PATH=$key_dir/AuthKey.p8" >> "$GITHUB_ENV"
+
+          proj=$(find upstream/build -maxdepth 2 -name '*.xcodeproj' | head -1)
+          [ -n "$proj" ] || { echo "::error::找不到生成的 Xcode 工程"; exit 1; }
+          scheme=$(xcodebuild -list -json -project "$proj" | jq -r '.project.schemes[] | select(test("iOS"))' | head -1)
+          if [ -z "$scheme" ]; then
+            xcodebuild -list -project "$proj"
+            echo "::error::找不到 iOS scheme"; exit 1
+          fi
+          echo "PROJ=$proj" >> "$GITHUB_ENV"
+          echo "SCHEME=$scheme" >> "$GITHUB_ENV"
+          # 构建号用时间戳，保证每次上传都比上一次大（同一版本号重复上传时也不会冲突）
+          echo "BUILD_NUMBER=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+          echo "Project: $proj / Scheme: $scheme"
+
+      - name: Archive
+        run: |
+          xcodebuild archive \
+            -project "$PROJ" \
+            -scheme "$SCHEME" \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            CODE_SIGN_STYLE=Automatic \
+            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+
+      - name: Export & upload to TestFlight
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+            <key>testFlightInternalTestingOnly</key><true/>
+            <key>uploadSymbols</key><true/>
+          </dict>
+          </plist>
+          EOF
+
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/app.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export" \
+            -allowProvisioningUpdates \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+
+          echo "### 已上传 ${TAG}（build ${BUILD_NUMBER}）到 TestFlight" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save state
+        run: |
+          mkdir -p .state
+          echo "$TAG" > .state/last-built
+          date +%s > .state/last-upload
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .state
+          git commit -m "testflight: ${TAG} (build ${BUILD_NUMBER})"
+          git pull --rebase
+          git push
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
