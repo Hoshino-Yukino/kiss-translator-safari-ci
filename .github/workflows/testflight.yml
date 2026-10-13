@@ -67,7 +67,8 @@ jobs:
   build:
     needs: check
     if: needs.check.outputs.build == 'true'
-    runs-on: macos-15
+    # App Store Connect 要求 iOS 26 SDK（Xcode 26）；macos-15 默认仍是 Xcode 16.4
+    runs-on: macos-26
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -126,6 +127,28 @@ jobs:
           sed -i '' "s/com\.fishjar\.kiss-translator/${BUNDLE_ID}/" "$script"
           echo "DEVELOPMENT_TEAM=${TEAM_ID}" > .env.local
 
+          # 上游用 "Kiss Translator" 区分大小写匹配 CFBundleDisplayName，而生成的是 "KISS Translator"，
+          # 导致 LSApplicationCategoryType / ITSAppUsesNonExemptEncryption 没有注入（macOS 上传校验必需）。
+          # 把这个正则改成不区分大小写。
+          grep -q '^      "g"$' "$script" || { echo "::error::上游构建脚本已变更，找不到 displayNameRegex 的 flag，请检查 $script"; exit 1; }
+          sed -i '' 's/^      "g"$/      "gi"/' "$script"
+
+          # Safari 扩展上传校验要求 manifest 的 description（app_description）不超过 112 个字符
+          node -e '
+            const fs = require("fs");
+            for (const f of process.argv.slice(1)) {
+              const j = JSON.parse(fs.readFileSync(f, "utf8"));
+              const d = j.app_description;
+              if (!d || [...d.message].length <= 112) continue;
+              let s = [...d.message].slice(0, 111).join("");
+              const sp = s.lastIndexOf(" ");
+              if (sp > 80) s = s.slice(0, sp);
+              d.message = s.replace(/[\s,.;:，、。]+$/, "") + "…";
+              fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n");
+              console.log(`${f}: app_description 截断为 ${[...d.message].length} 个字符`);
+            }
+          ' public/_locales/*/messages.json
+
       - name: Build Xcode project
         working-directory: upstream
         env:
@@ -155,6 +178,7 @@ jobs:
           echo "工程中的 Bundle ID："; ids
           bad=$(ids | grep -vxF -e "$BUNDLE_ID" -e "${BUNDLE_ID}.Extension" || true)
           [ -z "$bad" ] || { echo "::error::仍有不匹配的 Bundle ID: $bad"; exit 1; }
+          grep -q 'INFOPLIST_KEY_LSApplicationCategoryType' "$pbx" || { echo "::error::工程中缺少 LSApplicationCategoryType"; exit 1; }
 
       - name: Prepare signing key & project info
         run: |
