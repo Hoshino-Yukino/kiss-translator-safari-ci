@@ -175,20 +175,50 @@ jobs:
           echo "导入的签名身份："
           security find-identity -v -p codesigning "$keychain"
 
+      # 新版 Xcode 把描述文件放在 UserData 目录，旧位置是 MobileDevice 目录。
+      # 命令行用 API Key 下载描述文件时，写入和读取的位置可能不一致，
+      # 导致 "Build input file cannot be found: .../Provisioning Profiles/xxx.mobileprovision"。
+      # 让两个路径指向同一个目录，无论 Xcode 用哪一个都能找到。
+      - name: Unify provisioning profile directories
+        run: |
+          legacy="$HOME/Library/MobileDevice/Provisioning Profiles"
+          current="$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"
+          mkdir -p "$legacy" "$(dirname "$current")"
+          if [ -d "$current" ] && [ ! -L "$current" ]; then
+            cp -n "$current"/* "$legacy"/ 2>/dev/null || true
+            rm -rf "$current"
+          fi
+          ln -sfn "$legacy" "$current"
+          ls -la "$(dirname "$current")"
+          xcodebuild -version
+
       - name: Archive
         run: |
-          xcodebuild archive \
-            -project "$PROJ" \
-            -scheme "$SCHEME" \
-            -destination "generic/platform=${PLATFORM}" \
-            -archivePath "$RUNNER_TEMP/app.xcarchive" \
-            -allowProvisioningUpdates \
-            -authenticationKeyPath "$ASC_KEY_PATH" \
-            -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
-            DEVELOPMENT_TEAM="$TEAM_ID" \
-            CODE_SIGN_STYLE=Automatic \
-            CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          archive() {
+            xcodebuild archive \
+              -project "$PROJ" \
+              -scheme "$SCHEME" \
+              -destination "generic/platform=${PLATFORM}" \
+              -archivePath "$RUNNER_TEMP/app.xcarchive" \
+              -allowProvisioningUpdates \
+              -authenticationKeyPath "$ASC_KEY_PATH" \
+              -authenticationKeyID "$ASC_KEY_ID" \
+              -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+              DEVELOPMENT_TEAM="$TEAM_ID" \
+              CODE_SIGN_STYLE=Automatic \
+              CURRENT_PROJECT_VERSION="$BUILD_NUMBER"
+          }
+
+          if archive; then exit 0; fi
+
+          # 第一次失败时打印描述文件目录，再重试一次（此时描述文件通常已下载到磁盘）
+          echo "::warning::Archive 第一次失败，打印描述文件目录后重试"
+          for d in "$HOME/Library/MobileDevice/Provisioning Profiles" \
+                   "$HOME/Library/Developer/Xcode/UserData/Provisioning Profiles"; do
+            echo "== $d"; ls -la "$d" 2>&1 || true
+          done
+          rm -rf "$RUNNER_TEMP/app.xcarchive"
+          archive
 
       - name: Export & upload to TestFlight
         run: |
