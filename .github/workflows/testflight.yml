@@ -133,21 +133,6 @@ jobs:
           grep -q '^      "g"$' "$script" || { echo "::error::上游构建脚本已变更，找不到 displayNameRegex 的 flag，请检查 $script"; exit 1; }
           sed -i '' 's/^      "g"$/      "gi"/' "$script"
 
-          # 上游的扩展客户端名单 CLIENT_EXTS 漏了 "safari"，Safari 版因此 isExt=false：
-          # 设置存进各页面自己的 localStorage（网页里读不到设置页的设置），
-          # 悬浮按钮的「设置」会打开网页版设置页并报「连接油猴脚本超时」。把 "safari" 加进名单。
-          node -e '
-            const fs = require("fs");
-            const f = "src/config/client.js";
-            const s = fs.readFileSync(f, "utf8");
-            const m = s.match(/export const CLIENT_EXTS = \[[\s\S]*?\];/);
-            if (!m) { console.log("::error::上游 " + f + " 已变更，找不到 CLIENT_EXTS"); process.exit(1); }
-            if (/safari/i.test(m[0])) { console.log("CLIENT_EXTS 已包含 safari，跳过"); process.exit(0); }
-            fs.writeFileSync(f, s.replace(m[0], m[0].replace(/\];$/, "  \"safari\",\n];")));
-            console.log("CLIENT_EXTS 已加入 safari");
-          '
-          grep -A7 'export const CLIENT_EXTS' src/config/client.js
-
           # Safari 扩展上传校验要求 manifest 的 description（app_description）不超过 112 个字符
           node -e '
             const fs = require("fs");
