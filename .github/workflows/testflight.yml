@@ -132,6 +132,30 @@ jobs:
           CI: 'false'   # react-scripts 在 CI=true 时会把 lint 警告当成错误
         run: pnpm build:safari
 
+      # safari-web-extension-converter 并不直接使用 --bundle-identifier：
+      # 它取前缀 + App 名生成 "online.swqh.KISS-Translator"，与 App Store Connect 里的
+      # App 记录（BUNDLE_ID，区分大小写）对不上，导出时报 "Error Downloading App Information"。
+      # 这里把生成的 Bundle ID 统一替换成 BUNDLE_ID（含扩展 .Extension 和 Swift 代码里的引用）。
+      - name: Use BUNDLE_ID in generated project
+        run: |
+          proj=$(find upstream/build -maxdepth 2 -name '*.xcodeproj' | head -1)
+          pbx="$proj/project.pbxproj"
+          ids() { grep -o 'PRODUCT_BUNDLE_IDENTIFIER = [^;]*;' "$pbx" | sed -E 's/.* = "?([^";]*)"?;/\1/' | sort -u; }
+          generated=$(ids | grep -v '\.Extension$' || true)
+          if [ "$(printf '%s\n' "$generated" | grep -c .)" -ne 1 ]; then
+            ids; echo "::error::无法确定生成的 App Bundle ID"; exit 1
+          fi
+          if [ "$generated" != "$BUNDLE_ID" ]; then
+            echo "替换 Bundle ID: $generated → $BUNDLE_ID"
+            grep -rlF "$generated" "$(dirname "$proj")" | while IFS= read -r f; do
+              sed -i '' "s/${generated//./\\.}/${BUNDLE_ID}/g" "$f"
+              echo "  $f"
+            done
+          fi
+          echo "工程中的 Bundle ID："; ids
+          bad=$(ids | grep -vxF -e "$BUNDLE_ID" -e "${BUNDLE_ID}.Extension" || true)
+          [ -z "$bad" ] || { echo "::error::仍有不匹配的 Bundle ID: $bad"; exit 1; }
+
       - name: Prepare signing key & project info
         run: |
           key_dir="$RUNNER_TEMP/asc"
@@ -238,14 +262,23 @@ jobs:
           </plist>
           EOF
 
-          xcodebuild -exportArchive \
+          if ! xcodebuild -exportArchive \
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
             -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
             -exportPath "$RUNNER_TEMP/export" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$ASC_KEY_PATH" \
             -authenticationKeyID "$ASC_KEY_ID" \
-            -authenticationKeyIssuerID "$ASC_ISSUER_ID"
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID"; then
+            # 真正的失败原因在 .xcdistributionlogs 里；打印前去掉 token / Authorization 头
+            for f in "${TMPDIR:-/tmp}"/*.xcdistributionlogs/*.log; do
+              [ -f "$f" ] || continue
+              echo "::group::$(basename "$f")"
+              grep -v -i 'authorization' "$f" | sed -E 's/(Bearer |eyJ)[A-Za-z0-9._-]+/\1<redacted>/g' | tail -300
+              echo "::endgroup::"
+            done
+            exit 1
+          fi
 
           echo "### 已上传 ${PLATFORM} ${TAG}（build ${BUILD_NUMBER}）到 TestFlight" >> "$GITHUB_STEP_SUMMARY"
 
