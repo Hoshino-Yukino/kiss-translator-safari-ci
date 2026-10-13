@@ -69,7 +69,14 @@ jobs:
     if: needs.check.outputs.build == 'true'
     runs-on: macos-15
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # 不需要 macOS 版本时，删掉 macOS 这一行即可
+        platform: [iOS, macOS]
+    name: build (${{ matrix.platform }})
     env:
+      PLATFORM: ${{ matrix.platform }}
       TAG: ${{ needs.check.outputs.tag }}
       BUNDLE_ID: ${{ vars.BUNDLE_ID }}
       TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -132,10 +139,10 @@ jobs:
 
           proj=$(find upstream/build -maxdepth 2 -name '*.xcodeproj' | head -1)
           [ -n "$proj" ] || { echo "::error::找不到生成的 Xcode 工程"; exit 1; }
-          scheme=$(xcodebuild -list -json -project "$proj" | jq -r '.project.schemes[] | select(test("iOS"))' | head -1)
+          scheme=$(xcodebuild -list -json -project "$proj" | jq -r --arg p "$PLATFORM" '.project.schemes[] | select(test($p))' | head -1)
           if [ -z "$scheme" ]; then
             xcodebuild -list -project "$proj"
-            echo "::error::找不到 iOS scheme"; exit 1
+            echo "::error::找不到 $PLATFORM scheme"; exit 1
           fi
           echo "PROJ=$proj" >> "$GITHUB_ENV"
           echo "SCHEME=$scheme" >> "$GITHUB_ENV"
@@ -148,7 +155,7 @@ jobs:
           xcodebuild archive \
             -project "$PROJ" \
             -scheme "$SCHEME" \
-            -destination 'generic/platform=iOS' \
+            -destination "generic/platform=${PLATFORM}" \
             -archivePath "$RUNNER_TEMP/app.xcarchive" \
             -allowProvisioningUpdates \
             -authenticationKeyPath "$ASC_KEY_PATH" \
@@ -185,9 +192,21 @@ jobs:
             -authenticationKeyID "$ASC_KEY_ID" \
             -authenticationKeyIssuerID "$ASC_ISSUER_ID"
 
-          echo "### 已上传 ${TAG}（build ${BUILD_NUMBER}）到 TestFlight" >> "$GITHUB_STEP_SUMMARY"
+          echo "### 已上传 ${PLATFORM} ${TAG}（build ${BUILD_NUMBER}）到 TestFlight" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Clean up signing key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/asc"
+
+  # 所有平台都上传成功后才记录状态；任一平台失败，第二天会自动重试
+  record:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Save state
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
         run: |
           mkdir -p .state
           echo "$TAG" > .state/last-built
@@ -195,10 +214,6 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .state
-          git commit -m "testflight: ${TAG} (build ${BUILD_NUMBER})"
+          git commit -m "testflight: ${TAG}"
           git pull --rebase
           git push
-
-      - name: Clean up signing key
-        if: always()
-        run: rm -rf "$RUNNER_TEMP/asc"
