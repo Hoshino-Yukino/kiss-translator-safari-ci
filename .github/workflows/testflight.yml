@@ -180,6 +180,28 @@ jobs:
           [ -z "$bad" ] || { echo "::error::仍有不匹配的 Bundle ID: $bad"; exit 1; }
           grep -q 'INFOPLIST_KEY_LSApplicationCategoryType' "$pbx" || { echo "::error::工程中缺少 LSApplicationCategoryType"; exit 1; }
 
+      # 用仓库里的 assets/AppIcon-*.png 替换转换器生成的 App 图标（iOS 与 macOS 共用 AppIcon）
+      - name: Set app icon
+        run: |
+          proj=$(find upstream/build -maxdepth 2 -name '*.xcodeproj' | head -1)
+          sets=$(find "$(dirname "$proj")" -type d -path '*.xcassets/AppIcon.appiconset')
+          [ -n "$sets" ] || { echo "::error::找不到 AppIcon.appiconset"; exit 1; }
+          printf '%s\n' "$sets" | while IFS= read -r set; do
+            echo "== $set"
+            rm -f "$set"/*.png
+            cp assets/AppIcon-iOS.png "$set/icon-ios-1024.png"
+            images='{"filename":"icon-ios-1024.png","idiom":"universal","platform":"ios","size":"1024x1024"}'
+            for s in 16 32 128 256 512; do
+              for scale in 1 2; do
+                px=$((s * scale)); f="icon-mac-${s}@${scale}x.png"
+                sips -z "$px" "$px" assets/AppIcon-macOS.png --out "$set/$f" > /dev/null
+                images="$images,{\"filename\":\"$f\",\"idiom\":\"mac\",\"scale\":\"${scale}x\",\"size\":\"${s}x${s}\"}"
+              done
+            done
+            printf '{"images":[%s],"info":{"author":"xcode","version":1}}' "$images" | jq . > "$set/Contents.json"
+            ls "$set"
+          done
+
       - name: Prepare signing key & project info
         run: |
           key_dir="$RUNNER_TEMP/asc"
